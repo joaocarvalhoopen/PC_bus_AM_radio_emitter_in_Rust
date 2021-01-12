@@ -46,7 +46,6 @@ use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering}; // To write to memory bypassing cache.
 use std::sync::mpsc;                            // Channels inter-process communication.
 use std::sync::mpsc::{Sender, Receiver};
-
 use volatile::Volatile;
 
 static _NTHREADS: i32 = 1;
@@ -128,6 +127,66 @@ fn boost_song_2(rx: Receiver<TimePair>)
     }
 }
 
+
+/// The second version uses Volatile crate to write directly to memory
+/// bypassing all cache levels. [I don't know if this is really the case
+/// but it should be the case].
+
+#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), 
+target_feature = "sse2"))]
+fn boost_song_3(rx: Receiver<TimePair>)
+{
+    loop
+    {
+        // Get's from the main thread square_am_signal() and synchronizes this thread. 
+        let time_pair: TimePair = rx.recv().unwrap(); 
+        let mid:    u64 = time_pair.mid;
+        let period: u64 = time_pair.period;
+
+        #[cfg(target_arch = "x86_64")]
+        use std::arch::x86_64::*;
+    
+        // It uses the SIMD _mm_stream_si128 instruction to send data directly
+        // to memory bypassing the cache of the processor.
+        // Remember that it is the writing to the memory using the memory BUS
+        // that we want. 
+        unsafe{
+            let mut target_mem_m128i: __m128i = _mm_set1_epi32(0);
+            let all_bytes_zero_m128i: __m128i = _mm_setzero_si128();
+            // Creating all FFFF's or all ones in binary.
+            let all_bytes_ffff_m128i: __m128i = _mm_set1_epi32(-1);
+
+            // Pointer.
+            let reg_ptr = & mut target_mem_m128i as *mut __m128i;
+
+            // while core::arch::x86_64::_rdtsc() < mid     
+            loop
+            {
+                if  core::arch::x86_64::_rdtsc() > mid 
+                {
+                    break;
+                }
+                // Set memory of SSE2 register pointer.
+                _mm_stream_si128(reg_ptr, all_bytes_zero_m128i);
+                _mm_stream_si128(reg_ptr, all_bytes_ffff_m128i);
+            }
+        
+        // Thread sleep in Rust isn't very accurate, not even in the micro seconds region.    
+        // thread::sleep(Duration::from_nanos(period));
+
+            // Doing active wait, spinning, to get more accuracy.
+            loop
+            {
+                if  core::arch::x86_64::_rdtsc() > mid + period / 2
+                {
+                    break;
+                }
+            }
+        }
+
+    }
+}
+
 fn square_am_signal(tx: & Sender<TimePair>, time: f64, in_frequency: i32)
 {
     let frequency: f64 = in_frequency as f64; 
@@ -177,7 +236,21 @@ fn square_am_signal(tx: & Sender<TimePair>, time: f64, in_frequency: i32)
         };
         tx.send(time_pair).unwrap();
 
-        thread::sleep(Duration::from_nanos(period_as_u64));
+        // Thread sleep in Rust isn't very accurate, not even in the micro seconds region.    
+        // thread::sleep(Duration::from_nanos(period_as_u64));
+
+        unsafe 
+        {
+            // Doing active wait, spinning, to get more accuracy.
+            loop
+            {
+                if  core::arch::x86_64::_rdtsc() > mid + period_as_u64 / 2
+                {
+                    break;
+                }
+            }
+        }
+
         start = reset;
     }
 }
@@ -192,7 +265,7 @@ fn main() {
 //    {
         // Currently only boosts with one thread.
         let handle = thread::spawn(move || {
-            boost_song_1(rx);
+            boost_song_3(rx);
         });
         handles.push(handle);
 //    }
